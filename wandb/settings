@@ -1,0 +1,5 @@
+[default]
+entity = tonykorea99-dankook-university
+project = class_incremental
+base_url = https://api.wandb.ai
+
