@@ -1,5 +1,5 @@
 # ============================
-# v7.2: Professional Comments & Cleanup
+# v8.3: OOM Hotfix
 # ============================
 
 # ============================ 1. Imports ============================
@@ -19,10 +19,6 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 
 # --- Core Metrics ---
-# FrechetInceptionDistance: 생성 품질/다양성 (낮을수록 좋음)
-# LearnedPerceptualImagePatchSimilarity: 지각적 유사도 (낮을수록 좋음)
-# StructuralSimilarityIndexMeasure: 구조적 유사도 (높을수록 좋음)
-# InceptionScore: 생성 품질/선명도 (높을수록 좋음)
 from torchmetrics.image.fid import FrechetInceptionDistance
 from torchmetrics.image.inception import InceptionScore
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
@@ -60,12 +56,12 @@ class CFG:
     use_contrastive_baseline:bool = False # A 모델(Baseline)은 Contrastive 비활성화
     use_contrastive_exp:bool      = True  # B 모델(실험군)은 Contrastive 활성화
     tau:float = 0.4                       # Contrastive Loss의 온도(temperature) 파라미터
-    lambda_con_max:float = 0.05           # Contrastive 손실의 최대 가중치 (v6 설정: 0.05)
+    lambda_con_max:float = 0.05           # Contrastive 손실의 최대 가중치 (v6 설정)
     lambda_warmup_ep:int = 1              # Lambda 워밍업 에폭
     hard_k:int = 5                        # Hard Negative Mining을 위한 K값
 
     # --- Generative Replay ---
-    replay_ratio:float = 0.5   # 새 데이터 대비 리플레이 데이터의 비율 (e.g., 0.5 = 1:0.5)
+    replay_ratio:float = 0.5   # 새 데이터 대비 리플레이 데이터의 비율
     replay_sigma:float = 1.0   # 리플레이 생성 시 mu에 가해지는 노이즈 표준편차
     min_gen_per_cls:int = 8    # 리플레이 시 클래스당 최소 생성 샘플 수
 
@@ -74,11 +70,12 @@ class CFG:
     pin_memory:bool = torch.cuda.is_available()
 
     # --- Evaluation Metrics ---
-    eval_gen_per_class:int = 200 # FID/IS 등 평가 시 클래스당 생성할 샘플 수
+    # [피드백 1.1] N 개수 하이퍼파라미터화 및 증가
+    eval_n_per_class:int = 1000   # (v7: 200) 평가 시 클래스당 샘플 수 (MNIST Testset 클래스당 1000개)
     eval_resize:int = 299        # FID/IS 계산을 위한 Inception 모델 입력 크기
     eval_every_step:bool = True  # CIL 스텝(에폭)마다 평가 수행 여부
-    metric_batch:int = 32        # 평가 지표 계산 시 배치 크기
-    lpips_backbone:str = "alex"  # LPIPS 계산 시 사용할 백본 ("alex"|"vgg"|"squeeze")
+    metric_batch:int = 32        # [v8.3] OOM 방지를 위해 평가 배치 크기 줄임
+    lpips_backbone:str = "alex"  # LPIPS 계산 시 사용할 백본
     lpips_resize:int = 224       # LPIPS 계산을 위한 이미지 크기
 
     # --- Logging & Saving ---
@@ -89,7 +86,7 @@ class CFG:
     sample_grid_nrow: int = 16   # 샘플 그리드의 행당 이미지 수
 
     # --- W&B Project ---
-    wandb_project:str = "MNIST-CILv6" # v6 실험 프로젝트 이름
+    wandb_project:str = "MNIST-CILv9_OOM_fix" # [수정] 새 프로젝트 이름
     wandb_group:str = "MNIST_CIL"     # 두 실험(A, B)을 묶을 그룹 이름
     wandb_tags:tuple = ("mnist","vae","cil","gen-replay","metrics")
 
@@ -98,30 +95,19 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # ============================ 3. Model Definition ============================
 class VAE(nn.Module):
-    """
-    MNIST 데이터셋(1x28x28)에 맞춘 간단한 Convolutional VAE 모델.
-    - Encoder: (1, 28, 28) -> (64, 7, 7) -> z_dim
-    - Decoder: z_dim -> (64, 7, 7) -> (1, 28, 28)
-    - Proj: z_dim -> z_dim (Contrastive Loss를 위한 프로젝션 헤드)
-    """
     def __init__(self, zdim=CFG.z_dim):
         super().__init__()
-        # --- Encoder ---
         self.enc = nn.Sequential(
-            nn.Conv2d(1, 32, 3, 2, 1), nn.ReLU(),  # -> (32, 14, 14)
-            nn.Conv2d(32, 64, 3, 2, 1), nn.ReLU() # -> (64, 7, 7)
+            nn.Conv2d(1, 32, 3, 2, 1), nn.ReLU(),
+            nn.Conv2d(32, 64, 3, 2, 1), nn.ReLU()
         )
-        self.fc_mu = nn.Linear(64*7*7, zdim) # mu (평균)
-        self.fc_lv = nn.Linear(64*7*7, zdim) # log-variance (분산)
-        
-        # --- Decoder ---
+        self.fc_mu = nn.Linear(64*7*7, zdim)
+        self.fc_lv = nn.Linear(64*7*7, zdim)
         self.fc    = nn.Linear(zdim, 64*7*7)
         self.dec = nn.Sequential(
-            nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.ReLU(), # -> (32, 14, 14)
-            nn.ConvTranspose2d(32, 1, 4, 2, 1)            # -> (1, 28, 28)
+            nn.ConvTranspose2d(64, 32, 4, 2, 1), nn.ReLU(),
+            nn.ConvTranspose2d(32, 1, 4, 2, 1)
         )
-        
-        # --- Projection Head (for Contrastive Loss) ---
         self.proj = nn.Sequential(
             nn.Linear(zdim, zdim), 
             nn.ReLU(), 
@@ -133,7 +119,6 @@ class VAE(nn.Module):
         return self.fc_mu(h), self.fc_lv(h)
 
     def reparam(self, mu, lv):
-        """Reparameterization Trick: 샘플링 과정을 미분 가능하게 만듦"""
         std = (0.5*lv).exp()
         eps = torch.randn_like(std)
         return mu + eps*std
@@ -143,7 +128,6 @@ class VAE(nn.Module):
         return self.dec(h)
 
     def forward(self, x):
-        """모델의 표준 forward pass (학습 시 사용)"""
         mu, lv = self.encode(x)
         z = self.reparam(mu, lv)
         x_logits = self.decode(z)
@@ -151,97 +135,88 @@ class VAE(nn.Module):
 
     @torch.no_grad()
     def embed_mu(self, x, project=True):
-        """
-        데이터 x의 평균(mu) 잠재 벡터를 반환 (프로토타입 계산 시 사용).
-        project=True일 경우, Contrastive Loss용 프로젝션 헤드를 통과시킴.
-        """
         mu, _ = self.encode(x)
         return self.proj(mu) if project else mu
 
 # ============================ 4. Stateless Utilities ============================
-# (상태(state)를 갖지 않는 순수 헬퍼 함수들)
 
 def require_generation_metrics():
-    """torchmetrics 모듈이 올바르게 임포트되었는지 확인"""
     _ = FrechetInceptionDistance; _ = InceptionScore
     _ = LearnedPerceptualImagePatchSimilarity; _ = StructuralSimilarityIndexMeasure
 
 def set_seed(seed:int):
-    """실험 재현성을 위한 글로벌 시드 설정"""
     random.seed(seed); np.random.seed(seed)
     torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
 def make_class_order(num_classes=10, base_k=CFG.base_k, seed=CFG.seed):
-    """CIL 시나리오를 위한 클래스 순서를 생성 (Base / Stream 분리)"""
     r = random.Random(seed); classes = list(range(num_classes)); r.shuffle(classes)
     return classes[:base_k], classes[base_k:]
 
 def mnist_loader(selected, bs=CFG.batch_size, train=True, shuffle=True):
-    """지정된 클래스(selected)만 포함하는 MNIST DataLoader를 반환"""
     tfm = transforms.Compose([transforms.ToTensor()])
     ds = datasets.MNIST("./data", train=train, download=True, transform=tfm)
-    idx = [i for i,(_,y) in enumerate(ds) if y in selected]
-    sub = Subset(ds, idx)
+    if selected is not None:
+        idx = [i for i,(_,y) in enumerate(ds) if y in selected]
+        sub = Subset(ds, idx)
+    else:
+        sub = ds
+    
     return DataLoader(sub, batch_size=bs, shuffle=shuffle,
                       num_workers=CFG.num_workers, pin_memory=CFG.pin_memory)
 
 def beta_at_epoch(ep, warmup_ep=CFG.beta_warmup_cil, beta_max=CFG.beta_max):
-    """선형 워밍업 스케줄에 따라 현재 에폭의 beta 가중치를 반환"""
     if warmup_ep <= 0: return beta_max
     return beta_max * min(1.0, (ep+1)/float(warmup_ep))
 
 def kl_with_freebits(mu, logvar, free_bits=CFG.kl_free_bits):
-    """(beta-VAE) Free-Bits를 적용한 KL Divergence 계산"""
-    kl_elem = 0.5 * (torch.exp(logvar) + mu*mu - 1.0 - logvar)  # [B, Z]
+    kl_elem = 0.5 * (torch.exp(logvar) + mu*mu - 1.0 - logvar)
     if free_bits > 0.0:
-        # 각 차원(dim)의 KL 손실이 free_bits 임계값 미만이면 무시 (손실 0)
         kl_elem = torch.clamp(kl_elem, min=free_bits)
-    return kl_elem.sum(1).mean() # Batch 평균
+    return kl_elem.sum(1).mean()
 
 def vae_loss(x_logits, x, mu, lv, beta=1.0, free_bits=CFG.kl_free_bits):
-    """VAE의 최종 손실 (ELBO) 계산: 재구성 손실 + KL 손실"""
-    # 1. Reconstruction Loss (BCE)
     bce = F.binary_cross_entropy_with_logits(x_logits, x, reduction="mean")
-    # 2. Regularization Loss (KL)
     kl    = kl_with_freebits(mu, lv, free_bits)
-    
     total = bce + beta*kl
     return total, bce, kl
 
 def lambda_con_at_epoch(ep, warmup_ep=CFG.lambda_warmup_ep, lam_max=CFG.lambda_con_max):
-    """선형 워밍업 스케줄에 따라 현재 에폭의 lambda 가중치를 반환"""
     if warmup_ep <= 0: return lam_max
     return lam_max * min(1.0, (ep+1)/float(warmup_ep))
 
 def info_nce(pos_logit, neg_logits):
-    """InfoNCE (NT-Xent) Contrastive Loss 계산"""
     logits = torch.cat([pos_logit, neg_logits], 1)
     labels = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
     return F.cross_entropy(logits, labels)
 
 def optimize_model_for_runtime(model:nn.Module)->nn.Module:
-    """CUDA 환경에서 모델 연산 속도를 최적화 (TF32 허용 등)"""
     if DEVICE=="cuda":
         model = model.to(memory_format=torch.channels_last)
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
     return model
 
+@torch.no_grad()
+def _to_3ch_and_resize(x: torch.Tensor, size: int):
+    if x.shape[1] == 3:
+        if x.shape[2] == size and x.shape[3] == size:
+            return x
+        return F.interpolate(x, size=(size, size), mode="bilinear", align_corners=False)
+    x3 = x.repeat(1,3,1,1)
+    return F.interpolate(x3, size=(size, size), mode="bilinear", align_corners=False)
+
 # --- File I/O Utilities ---
 
 def _now_str():
-    """파일/디렉토리 이름 생성을 위한 현재 시각 문자열 반환"""
     return datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
 def init_run_dir(label: str) -> Path:
-    """실험 결과를 저장할 고유한 디렉토리 생성 및 반환"""
     root = Path(CFG.out_root); root.mkdir(parents=True, exist_ok=True)
     run_dir = root / f"{_now_str()}_{label}"
     run_dir.mkdir(parents=True, exist_ok=True)
     return run_dir
 
 def save_config(run_dir: Path, base_classes, stream_classes):
-    """실험 설정(CFG)을 JSON 파일로 저장"""
     cfg_dict = {k: getattr(CFG, k) for k in CFG.__dataclass_fields__.keys()}
     payload = {"cfg": cfg_dict, "device": DEVICE,
                "base_classes": base_classes, "stream_classes": stream_classes}
@@ -249,7 +224,6 @@ def save_config(run_dir: Path, base_classes, stream_classes):
         json.dump(payload, f, indent=2, ensure_ascii=False)
 
 def save_metrics_csv(run_dir: Path, metrics: dict, filename: str):
-    """수집된 메트릭(dict)을 CSV 파일로 저장"""
     keys = ["steps", "global_batch"] + [k for k in metrics.keys() if k not in ["steps", "global_batch"]]
     lines = [",".join(keys)]
     n = len(metrics["steps"])
@@ -265,28 +239,30 @@ def save_metrics_csv(run_dir: Path, metrics: dict, filename: str):
     (run_dir / filename).write_text("\n".join(lines), encoding="utf-8")
 
 def save_json(run_dir: Path, obj: dict, filename: str):
-    """dict 객체를 JSON 파일로 저장"""
     with open(run_dir / filename, "w", encoding="utf-8") as f:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 def save_plot(fig_path: Path):
-    """Matplotlib 플롯을 이미지 파일로 저장"""
     plt.tight_layout(); plt.savefig(fig_path, dpi=150)
     if CFG.show_plots: plt.show()
     else: plt.close()
 
 def save_image_grid(tensor_BCHW: torch.Tensor, path: Path, nrow: int = CFG.sample_grid_nrow):
-    """이미지 텐서(BCHW)를 하나의 그리드 이미지 파일로 저장"""
     grid = make_grid(tensor_BCHW.clamp(0,1).cpu(), nrow=nrow, padding=2)
     save_image(grid, path)
     
 def plot_metric(mA, mB, key, title, ylabel, save_dir: Path = None, fname: str = None):
-    """A/B 모델의 메트릭(key)을 비교하는 플롯을 생성 및 저장"""
-    # x축을 CIL 스텝(steps)이 아닌 글로벌 배치(global_batch)로 설정
     x_key = "global_batch" if "global_batch" in mA and "global_batch" in mB else "steps"
+    
+    key_a = key if key in mA else f"{key}_all"
+    key_b = key if key in mB else f"{key}_all"
+
     plt.figure()
-    plt.plot(mA.get(x_key, []), mA.get(key, []), '-o', label="Baseline (A)")
-    plt.plot(mB.get(x_key, []), mB.get(key, []), '-o', label="Contrastive (B)")
+    if key_a in mA:
+        plt.plot(mA.get(x_key, []), mA.get(key_a, []), '-o', label=f"Baseline (A) {key_a}")
+    if key_b in mB:
+        plt.plot(mB.get(x_key, []), mB.get(key_b, []), '-o', label=f"Contrastive (B) {key_b}")
+    
     plt.xlabel("Global Batch Step"); plt.ylabel(ylabel) 
     plt.title(title); plt.grid(True); plt.legend()
     
@@ -296,15 +272,8 @@ def plot_metric(mA, mB, key, title, ylabel, save_dir: Path = None, fname: str = 
         if CFG.show_plots: plt.show()
         else: plt.close()
 
-# ============================ 5. Evaluation Functions ============================
-# (모델의 생성 품질을 평가하는 함수들)
-
-@torch.no_grad()
-def _to_3ch_and_resize(x: torch.Tensor, size: int):
-    """1채널 MNIST 이미지를 FID/IS/LPIPS 계산용 3채널 이미지로 변환 및 리사이즈"""
-    if x.size(1) == 3: return F.interpolate(x, size=(size, size), mode="bilinear", align_corners=False)
-    x3 = x.repeat(1,3,1,1)
-    return F.interpolate(x3, size=(size, size), mode="bilinear", align_corners=False)
+# ============================ 5. Evaluation Functions (Moved) ============================
+# (v8.2: MetricCalculator 클래스 위로 이동)
 
 @torch.no_grad()
 def generate_eval_samples(model, classes, per_class: int, mu_proto_bank: dict):
@@ -326,60 +295,6 @@ def generate_eval_samples(model, classes, per_class: int, mu_proto_bank: dict):
         xs.append(torch.sigmoid(model.decode(z)))
     X_fake = torch.cat(xs,0) if xs else torch.empty(0,1,28,28, device=DEVICE)
     return X_real, X_fake
-
-@torch.no_grad()
-def evaluate_generation(model, classes, mu_proto_bank: dict):
-    """
-    모델의 생성 품질을 SSIM, FID, IS, LPIPS 지표로 평가합니다.
-    (torchmetrics 라이브러리 사용)
-    """
-    X_real, X_fake = generate_eval_samples(model, classes, CFG.eval_gen_per_class, mu_proto_bank)
-    if X_real.numel()==0 or X_fake.numel()==0:
-        print("Warning: Not enough real/fake images to evaluate generation metrics. Returning empty dict.")
-        return {} 
-
-    # --- 1. SSIM (Structural Similarity) ---
-    ssim = StructuralSimilarityIndexMeasure(data_range=1.0).to(DEVICE)
-    N = min(X_real.size(0), X_fake.size(0))
-    if N == 0:
-        print("Warning: Mismatch in real/fake samples (N=0). Returning empty dict.")
-        return {}
-    ssim_val = float(ssim(X_fake[:N], X_real[:N]).item())
-
-    # --- 2. FID (Fréchet Inception Distance) ---
-    Xr_299_u8 = (_to_3ch_and_resize(X_real, CFG.eval_resize) * 255).clamp(0,255).to(torch.uint8)
-    Xf_299_u8 = (_to_3ch_and_resize(X_fake, CFG.eval_resize) * 255).clamp(0,255).to(torch.uint8)
-
-    fid = FrechetInceptionDistance().to(DEVICE)
-    bs = CFG.metric_batch
-    for i in range(0, Xr_299_u8.size(0), bs): fid.update(Xr_299_u8[i:i+bs], real=True)
-    for i in range(0, Xf_299_u8.size(0), bs): fid.update(Xf_299_u8[i:i+bs], real=False) 
-    fid_val = float(fid.compute().item())
-
-    # --- 3. IS (Inception Score) ---
-    isc = InceptionScore().to(DEVICE)
-    for i in range(0, Xf_299_u8.size(0), bs): isc.update(Xf_299_u8[i:i+bs])
-    is_mean, _ = isc.compute()
-    is_val = float(is_mean.item())
-
-    # --- 4. LPIPS (Learned Perceptual Image Patch Similarity) ---
-    # LPIPS는 -1~1 범위의 픽셀값을 기대
-    Xr_lp = (_to_3ch_and_resize(X_real, CFG.lpips_resize) * 2.0) - 1.0
-    Xf_lp = (_to_3ch_and_resize(X_fake, CFG.lpips_resize) * 2.0) - 1.0
-    
-    lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type=CFG.lpips_backbone).to(DEVICE)
-    L = min(Xr_lp.size(0), Xf_lp.size(0))
-    
-    Xr_lp = Xr_lp[:L] # 배치 크기 불일치 방지
-    Xf_lp = Xf_lp[:L]
-
-    lpips_val = 0.0
-    if L > 0:
-        for i in range(0, L, bs):
-            lpips_metric.update(Xf_lp[i:i+bs], Xr_lp[i:i+bs])
-        lpips_val = float(lpips_metric.compute().item())
-
-    return {"SSIM": ssim_val, "FID": fid_val, "IS": is_val, "LPIPS": lpips_val}
 
 @torch.no_grad()
 def analyze_proto_separation(classes, proto_bank: dict):
@@ -429,31 +344,220 @@ def train_base(model, loader):
         print(f"[BASE] ep {ep+1} | beta={beta:.2f} | total={m_total/n:.4f} | BCE={m_bce/n:.4f} | KL={m_kl/n:.4f}")
     return model
 
-# ============================ 7. CIL Trainer Class ============================
+# ============================ 7. Metric Calculator Class ============================
+# [피드백 2 & 3] 평가 로직을 담당하는 별도 클래스
+
+class MetricCalculator:
+    """
+    모든 평가 지표(Recon, Gen)의 계산을 담당하는 클래스.
+    CIL_Trainer로부터 모델과 프로토타입 뱅크를 주입받아 사용합니다.
+    """
+    def __init__(self, model: VAE, classes_to_eval: list, mu_proto_bank: dict, proto_bank: dict):
+        self.model = model
+        self.classes_to_eval = classes_to_eval
+        self.mu_proto_bank = mu_proto_bank   # For Generation
+        self.proto_bank = proto_bank         # For Separation analysis
+        self.metrics = {} # 계산된 지표를 누적할 딕셔너리
+        
+        # [v8.3] OOM 방지를 위해, Global FID/IS 계산기는 클래스 레벨에서 *재사용*
+        # Per-class 계산기는 메서드 내에서 일회용으로 생성
+        self.ssim_metric = StructuralSimilarityIndexMeasure(data_range=1.0, reduction=None).to(DEVICE)
+        self.lpips_metric = LearnedPerceptualImagePatchSimilarity(net_type=CFG.lpips_backbone, reduction=None).to(DEVICE)
+        
+        self.global_fid = FrechetInceptionDistance().to(DEVICE)
+        self.global_isc = InceptionScore().to(DEVICE)
+        # Per-class 계산기는 메서드 내에서 생성 (매번 리셋)
+        self.per_class_fid = FrechetInceptionDistance().to(DEVICE)
+        self.per_class_isc = InceptionScore().to(DEVICE)
+
+
+    def _log(self, name: str, value: float):
+        """계산된 지표를 내부 딕셔너리에 저장"""
+        self.metrics[name] = value
+
+    @torch.no_grad()
+    def run_all_metrics(self) -> dict:
+        """
+        [피드백 3]
+        모든 평가(Recon, Gen, Separation)를 실행하고 W&B 로깅을 위한 dict를 반환합니다.
+        """
+        print(f"[{self.model.label}] Running evaluations for classes: {self.classes_to_eval}")
+        self.model.eval()
+        
+        # [피드백 3.2 tag="Recon"] 재구성 품질 평가 (SSIM, LPIPS)
+        self._calculate_reconstruction_metrics()
+        
+        # [피드백 3.2 tag="Gen"] 생성 품질 평가 (FID, IS)
+        self._calculate_generation_metrics()
+        
+        # 프로토타입 분리도 평가
+        self._calculate_separation_metrics()
+        
+        self.model.train()
+        return self.metrics
+
+    @torch.no_grad()
+    def _calculate_reconstruction_metrics(self):
+        """
+        [피드백 2] (Recon)
+        전체 테스트셋을 루프 돌며 클래스별 SSIM, LPIPS를 계산합니다.
+        (이 함수는 메모리 집약적이지 않으므로 v8.2와 동일)
+        """
+        print("... calculating Reconstruction metrics (SSIM, LPIPS) ...")
+        test_loader = mnist_loader(selected=None, bs=CFG.metric_batch, train=False, shuffle=False)
+        
+        all_ssim = []
+        all_lpips = []
+        all_y = []
+        
+        for x, y in test_loader:
+            x, y = x.to(DEVICE), y.to(DEVICE)
+            
+            mask = torch.tensor([item in self.classes_to_eval for item in y], dtype=torch.bool).to(DEVICE)
+            if not mask.any():
+                continue
+            
+            x_filtered, y_filtered = x[mask], y[mask]
+            
+            x_logits, _, _, _ = self.model(x_filtered)
+            x_recon = torch.sigmoid(x_logits)
+            
+            ssim_vals = self.ssim_metric(x_recon, x_filtered)
+            
+            x_recon_lpips = (_to_3ch_and_resize(x_recon, CFG.lpips_resize) * 2.0) - 1.0
+            x_filtered_lpips = (_to_3ch_and_resize(x_filtered, CFG.lpips_resize) * 2.0) - 1.0
+            lpips_vals = self.lpips_metric(x_recon_lpips, x_filtered_lpips)
+            
+            all_ssim.append(ssim_vals.cpu())
+            all_lpips.append(lpips_vals.cpu())
+            all_y.append(y_filtered.cpu())
+
+        if not all_y:
+            print("Warning: No test data found for reconstruction metrics.")
+            return
+
+        all_ssim = torch.cat(all_ssim)
+        all_lpips = torch.cat(all_lpips)
+        all_y = torch.cat(all_y)
+        
+        for c in self.classes_to_eval:
+            mask = (all_y == c)
+            if mask.any():
+                c_ssim = all_ssim[mask].mean().item()
+                c_lpips = all_lpips[mask].mean().item()
+                self._log(f"Eval/Recon/cl/{c}/SSIM", c_ssim)
+                self._log(f"Eval/Recon/cl/{c}/LPIPS", c_lpips)
+        
+        self._log(f"Eval/Recon/all/SSIM", all_ssim.mean().item())
+        self._log(f"Eval/Recon/all/LPIPS", all_lpips.mean().item())
+
+    @torch.no_grad()
+    def _calculate_generation_metrics(self):
+        """
+        [v8.3 OOM FIX]
+        Global FID/IS 계산 시 torch.cat을 사용하지 않고, 
+        per-class 루프 내에서 global metric 객체를 청크(chunk) 단위로 .update() 합니다.
+        """
+        print("... calculating Generation metrics (FID, IS) ...")
+        
+        # [v8.3] Global 계산기 리셋
+        self.global_fid.reset()
+        self.global_isc.reset()
+        bs = CFG.metric_batch
+        
+        # [피드백 2.2] 클래스별 FID/IS 계산
+        for c in self.classes_to_eval:
+            # [피드백 1.1, 1.2] N개 샘플을 매번 새로 생성
+            real_c, fake_c = self._generate_samples_for_class(c, CFG.eval_n_per_class)
+            
+            if real_c is None or fake_c is None:
+                continue
+
+            # 3채널, 299x299, uint8로 변환
+            real_c_u8 = (_to_3ch_and_resize(real_c, CFG.eval_resize) * 255).clamp(0,255).to(torch.uint8)
+            fake_c_u8 = (_to_3ch_and_resize(fake_c, CFG.eval_resize) * 255).clamp(0,255).to(torch.uint8)
+            
+            # [v8.3] 1. Per-Class FID (일회용 계산기 사용)
+            self.per_class_fid.reset()
+            for i in range(0, real_c_u8.size(0), bs): self.per_class_fid.update(real_c_u8[i:i+bs], real=True)
+            for i in range(0, fake_c_u8.size(0), bs): self.per_class_fid.update(fake_c_u8[i:i+bs], real=False)
+            fid_val_c = self.per_class_fid.compute().item()
+            self._log(f"Eval/Gen/cl/{c}/FID", fid_val_c)
+            
+            # [v8.3] 2. Per-Class IS (일회용 계산기 사용)
+            self.per_class_isc.reset()
+            for i in range(0, fake_c_u8.size(0), bs): self.per_class_isc.update(fake_c_u8[i:i+bs])
+            is_val_c, _ = self.per_class_isc.compute()
+            self._log(f"Eval/Gen/cl/{c}/IS", is_val_c.item())
+
+            # [v8.3] 3. Global FID/IS에 청크(클래스) 단위로 데이터 추가 (OOM 방지)
+            for i in range(0, real_c_u8.size(0), bs): self.global_fid.update(real_c_u8[i:i+bs], real=True)
+            for i in range(0, fake_c_u8.size(0), bs): self.global_fid.update(fake_c_u8[i:i+bs], real=False)
+            for i in range(0, fake_c_u8.size(0), bs): self.global_isc.update(fake_c_u8[i:i+bs])
+
+        # [v8.3] 4. 루프가 끝난 후, Global FID/IS 최종 계산
+        try:
+            fid_val_all = self.global_fid.compute().item()
+            is_val_all, _ = self.global_isc.compute()
+            self._log(f"Eval/Gen/all/FID", fid_val_all)
+            self._log(f"Eval/Gen/all/IS", is_val_all.item())
+        except Exception as e:
+            print(f"Warning: Could not compute global FID/IS. Error: {e}")
+            self._log(f"Eval/Gen/all/FID", -1.0) # 에러 발생 시 -1
+            self._log(f"Eval/Gen/all/IS", -1.0)
+
+    @torch.no_grad()
+    def _generate_samples_for_class(self, c: int, n: int):
+        """특정 클래스 'c'의 실제/생성 샘플 'n'개를 반환"""
+        # Real (Testset에서 n개)
+        real_loader_c = mnist_loader(selected=[c], bs=n, train=False, shuffle=True)
+        try:
+            X_real_c = next(iter(real_loader_c))[0].to(DEVICE)
+        except StopIteration:
+            print(f"Warning: No real test data for class {c}.")
+            return None, None
+        
+        # Fake (mu_proto에서 n개 생성)
+        if c not in self.mu_proto_bank:
+            print(f"Warning: No mu-prototype for class {c}, cannot generate.")
+            return X_real_c, None
+        
+        mu_c = self.mu_proto_bank[c].to(DEVICE)
+        z = mu_c.unsqueeze(0) + CFG.replay_sigma*torch.randn(n, mu_c.numel(), device=DEVICE)
+        X_fake_c = torch.sigmoid(self.model.decode(z))
+        
+        return X_real_c, X_fake_c
+
+    @torch.no_grad()
+    def _calculate_separation_metrics(self):
+        """프로토타입 분리도(Separation)를 계산"""
+        print("... calculating Separation metrics ...")
+        sep_metrics = analyze_proto_separation(self.classes_to_eval, self.proto_bank)
+        for k,v in sep_metrics.items():
+            self._log(f"Eval/Sep/{k}", v)
+
+# ============================ 8. CIL Trainer Class ============================
 class CIL_Trainer:
     """
-    Class-Incremental Learning(CIL)의 전체 학습/평가 과정을 관리하는 클래스.
-    - 전역 변수 대신 클래스 내부 변수(self.proto_bank)로 상태를 관리합니다.
-    - CIL의 복잡한 로직을 메서드로 분리하여 가독성을 높입니다.
+    CIL의 전체 학습/평가 과정을 관리하는 클래스.
+    v8: 평가 로직을 MetricCalculator 클래스로 완전 분리.
     """
     def __init__(self, model, base_classes, use_contrastive, label, run_dir, wb_run):
         self.model = model
-        self.use_contrastive = use_contrastive # Contrastive Loss 사용 여부
-        self.label = label                     # "A" (Baseline) or "B" (Contrastive)
-        self.run_dir = run_dir                 # 로컬 저장 경로
-        self.wb_run = wb_run                   # W&B run 객체
+        self.model.label = label 
+        self.use_contrastive = use_contrastive 
+        self.label = label                     
+        self.run_dir = run_dir                 
+        self.wb_run = wb_run                   
         
         self.opt = torch.optim.Adam(self.model.parameters(), lr=CFG.lr)
-        self.seen = base_classes.copy()      # 현재까지 학습한 클래스 목록
-        self.global_batch_counter = 0        # W&B x축으로 사용할 글로벌 스텝
-        self.metrics = defaultdict(list)     # 로컬 메트릭 저장용
-        self.current_new_c = None            # 현재 학습 중인 새 클래스 (로깅용)
+        self.seen = base_classes.copy()      
+        self.global_batch_counter = 0        
+        self.metrics = defaultdict(list)     
+        self.current_new_c = None            
         
-        # --- Prototype Banks (전역 변수 대체) ---
         print(f"[{self.label}] Initializing prototype banks for base classes...")
-        # Contrastive Loss용 프로토타입 (proj(mu) 기반)
         self.proto_bank = self._update_proto({}, self.seen)
-        # Generative Replay용 프로토타입 (raw mu 기반)
         self.mu_proto_bank = self._update_mu_proto({}, self.seen)
 
     # --- Prototype Bank Management ---
@@ -477,7 +581,6 @@ class CIL_Trainer:
         for c in classes:
             if counts[c]==0: continue
             new = sums[c]/counts[c]
-            # EMA (Exponential Moving Average)로 부드럽게 업데이트
             proto_bank[c] = (ema*proto_bank[c] + (1-ema)*new) if c in proto_bank else new.clone()
         return proto_bank
 
@@ -524,7 +627,6 @@ class CIL_Trainer:
         if not xs: return None, None
         X, Y = torch.cat(xs,0), torch.cat(ys,0)
         
-        # 생성된 샘플 수가 필요한 것보다 많으면 랜덤 샘플링
         if X.size(0) > total_needed:
             idx = torch.randperm(X.size(0), device=DEVICE)[:total_needed]
             X, Y = X[idx], Y[idx]
@@ -536,7 +638,6 @@ class CIL_Trainer:
         B, D = z_new.shape
         z_pos = torch.empty_like(z_new)
         
-        # Positive: 같은 클래스의 평균 벡터 (또는 프로토타입)
         for c in y.unique():
             mask = (y==c)
             cls_vecs = z_new[mask]
@@ -548,7 +649,6 @@ class CIL_Trainer:
                 m = cls_vecs[0]
             z_pos[mask] = m
 
-        # Negative: 다른 클래스의 프로토타입 (Hard Negative Mining)
         if any(c in self.proto_bank for c in seen):
             neg_mat = torch.stack([self.proto_bank[c] for c in seen if c in self.proto_bank], dim=0).to(z_new.device)
         else:
@@ -556,7 +656,7 @@ class CIL_Trainer:
 
         bmean = F.normalize(z_new.mean(0,keepdim=True),dim=1) # 배치 평균
         negn  = F.normalize(neg_mat,dim=1)
-        sims  = F.cosine_similarity(bmean, negn) # 배치 평균과 가장 유사한(어려운) K개 선택
+        sims  = F.cosine_similarity(bmean, negn) 
         k     = min(hard_k, neg_mat.size(0))
         _,idx = sims.topk(k)
         z_neg = neg_mat[idx]
@@ -580,7 +680,6 @@ class CIL_Trainer:
             
             total = total + lam * con_loss
             
-            # p_pos: Positive 샘플일 확률 (로깅용)
             batch_p_pos = float(torch.softmax(torch.cat([pos_logit, neg_logits],1),1)[:,0].mean().item())
         
         return total, bce, kl, batch_p_pos
@@ -597,42 +696,42 @@ class CIL_Trainer:
             wb_payload["train/p_pos"] = batch_p_pos
         self.wb_run.log(wb_payload, step=self.global_batch_counter)
 
-    def _run_epoch_evaluation(self, classes_to_eval):
-        """매 에폭 종료 시, 생성 품질(eval) 및 요약(summary) 지표를 계산합니다."""
-        # 평가를 위해 현재 에폭 기준 프로토타입 업데이트
+    # [v8.1 BUG FIX]
+    def _run_epoch_evaluation(self, classes_to_eval) -> dict:
+        """
+        매 에폭 종료 시, MetricCalculator를 호출하여 모든 평가를 수행.
+        """
+        # [FIX] 계산기 생성 *전에* 트레이너의 뱅크를 먼저 업데이트합니다.
         self.proto_bank = self._update_proto(self.proto_bank, classes_to_eval, ema=0.9)
         self.mu_proto_bank = self._update_mu_proto(self.mu_proto_bank, classes_to_eval, ema=0.9)
-        
-        print(f"[{self.label}] Epoch eval: analyzing separation...")
-        sep_metrics = analyze_proto_separation(classes_to_eval, self.proto_bank)
-        
-        gen_metrics = {}
-        if CFG.eval_every_step:
-            print(f"[{self.label}] Epoch eval: evaluating generation...")
-            gen_metrics = evaluate_generation(self.model, classes_to_eval, self.mu_proto_bank)
-        
-        return sep_metrics, gen_metrics
+            
+        calculator = MetricCalculator(
+            model=self.model,
+            classes_to_eval=classes_to_eval,
+            mu_proto_bank=self.mu_proto_bank, # 업데이트된 뱅크 전달
+            proto_bank=self.proto_bank      # 업데이트된 뱅크 전달
+        )
+        all_metrics = calculator.run_all_metrics()
+        return all_metrics
 
-    def _log_epoch_to_wandb(self, epoch_metrics, sep_metrics, gen_metrics):
-        """매 에폭 종료 지표를 W&B에 로깅합니다."""
+    def _log_epoch_to_wandb(self, epoch_metrics: dict, eval_metrics: dict):
+        """매 에폭 종료 지표(학습 요약 + 평가)를 W&B에 로깅합니다."""
+        
+        # 1. 학습 요약 지표 (Summary)
         wb_payload = {
             "summary/total": epoch_metrics["total"],
             "summary/BCE":   epoch_metrics["bce"],
             "summary/KL":    epoch_metrics["kl"],
         }
-        # eval/ 지표 동적 추가
-        for k,v in gen_metrics.items():
-            wb_payload[f"eval/{k}"] = v
-        # eval/sep_ 지표 동적 추가
-        for k,v in sep_metrics.items():
-            wb_payload[f"eval/sep_{k}"] = v
-
         if self.use_contrastive:
             wb_payload["summary/p_pos"] = epoch_metrics["p_pos"]
         
+        # 2. 평가 지표 (Eval)
+        wb_payload.update(eval_metrics)
+        
         self.wb_run.log(wb_payload, step=self.global_batch_counter)
 
-        # W&B에 샘플 이미지 로깅
+        # 3. W&B에 샘플 이미지 로깅
         if CFG.save_sample_grid:
             with torch.no_grad():
                 classes_to_sample = self.seen + [self.current_new_c]
@@ -649,17 +748,16 @@ class CIL_Trainer:
                 if logs:
                     self.wb_run.log(logs, step=self.global_batch_counter)
 
-    def _save_local_artifacts(self, step, gen_metrics):
+    def _save_local_artifacts(self, step, eval_metrics: dict):
         """CIL 스텝 종료 시 로컬에 로그 및 샘플 이미지를 저장합니다."""
         if self.run_dir is None:
             return
             
-        step_log = {"step": step, "label": self.label, **gen_metrics} 
+        step_log = {"step": step, "label": self.label, **eval_metrics} 
         with open(self.run_dir / "gen_metrics_log.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(step_log) + "\n")
             
         if CFG.save_sample_grid:
-            # 이 시점에는 self.seen이 new_c를 포함했음
             X_real_small, X_fake_small = generate_eval_samples(
                 self.model, self.seen, per_class=16, mu_proto_bank=self.mu_proto_bank
             )
@@ -678,20 +776,16 @@ class CIL_Trainer:
             dl_new = mnist_loader([new_c], bs=CFG.batch_size, train=True, shuffle=True)
             self.model.train()
 
-            # Generative Replay를 위한 현재 모델 상태 고정
             gen_model = copy.deepcopy(self.model).eval()
             for p in gen_model.parameters(): p.requires_grad_(False)
-
-            # 현 스텝 시작 전 프로토타입 분리도 측정 (pre)
-            pre_sep = analyze_proto_separation(self.seen, self.proto_bank)
+            
+            latest_eval_metrics = {} # 마지막 에폭의 평가 지표 저장용
 
             for ep in range(CFG.epochs_cil):
                 
-                # 현 에폭의 beta, lambda 가중치 계산
                 beta = beta_at_epoch(ep, CFG.beta_warmup_cil, CFG.beta_max)
                 lam  = lambda_con_at_epoch(ep, CFG.lambda_warmup_ep, CFG.lambda_con_max) if self.use_contrastive else 0.0
 
-                # 에폭별 메트릭 초기화
                 m_total=m_bce=m_kl=m_ppos=0.0; n_batches=0
 
                 # --- Batch Loop ---
@@ -730,7 +824,7 @@ class CIL_Trainer:
                         self._log_batch_to_wandb(total, bce, kl, batch_p_pos)
                 
                 # --- End of Epoch ---
-                # 7. Log Epoch Metrics
+                # 7. Log Epoch Metrics (Summary)
                 epoch_metrics = {
                     "total": m_total/n_batches,
                     "bce": m_bce/n_batches,
@@ -744,24 +838,23 @@ class CIL_Trainer:
 
                 # 8. Run Evaluation (Heavy)
                 classes_to_eval = self.seen + [new_c]
-                sep_metrics, gen_metrics = self._run_epoch_evaluation(classes_to_eval)
+                eval_metrics = self._run_epoch_evaluation(classes_to_eval)
+                latest_eval_metrics = eval_metrics # 로컬 저장을 위해 마지막 값 저장
                 
-                # 9. Log Evaluation Metrics
-                for k,v in gen_metrics.items(): self.metrics[f"gen_{k}"].append(v)
-                for k,v in pre_sep.items(): self.metrics[f"pre_sep_{k}"].append(v)
-                for k,v in sep_metrics.items(): self.metrics[f"post_sep_{k}"].append(v)
-                pre_sep = sep_metrics # 다음 에폭의 pre_sep으로 사용
-                
+                # 9. Log Evaluation Metrics (to local dict & W&B)
+                for k,v in eval_metrics.items(): 
+                    self.metrics[k.replace("Eval/Gen/all/", "gen_").replace("Eval/Recon/all/", "recon_")].append(v)
+
                 if self.wb_run:
-                    self._log_epoch_to_wandb(epoch_metrics, sep_metrics, gen_metrics)
+                    self._log_epoch_to_wandb(epoch_metrics, eval_metrics)
                 
-                gm = ", ".join([f"{k}={v:.3f}" for k,v in gen_metrics.items()])
-                print(f"[{self.label}] step {step} ep {ep+1} | total={epoch_metrics['total']:.4f} | GEN[{gm or 'N/A'}]")
+                gm = eval_metrics.get("Eval/Gen/all/FID", 0.0)
+                print(f"[{self.label}] step {step} ep {ep+1} | total={epoch_metrics['total']:.4f} | Global FID: {gm:.3f}")
             
             # --- End of CIL Step ---
             # 10. Update 'seen' list and save artifacts
             self.seen.append(new_c)
-            self._save_local_artifacts(step, gen_metrics) # 마지막 에폭의 gen_metrics 사용
+            self._save_local_artifacts(step, latest_eval_metrics) 
             
             # 11. Update prototype banks for *next* step's replay
             self.proto_bank = self._update_proto(self.proto_bank, self.seen)
@@ -776,7 +869,7 @@ class CIL_Trainer:
         
         return self.metrics
 
-# ============================ 8. Main Execution ============================
+# ============================ 9. Main Execution ============================
 def main():
     require_generation_metrics()
     set_seed(CFG.seed)
@@ -853,16 +946,15 @@ def main():
         plot_metric(metricsA, metricsB, "total", "Total Loss per Step", "Total", save_dir=runB, fname="plot_total.png")
         plot_metric(metricsA, metricsB, "bce",   "Recon (BCE) per Step", "BCE", save_dir=runB, fname="plot_bce.png")
         plot_metric(metricsA, metricsB, "kl",    "KL per Step", "KL", save_dir=runB, fname="plot_kl.png")
-        plot_metric(metricsA, metricsB, "gen_SSIM", "SSIM per Epoch", "SSIM", save_dir=runB, fname="plot_ssim.png")
-        plot_metric(metricsA, metricsB, "gen_FID", "FID per Epoch", "FID", save_dir=runB, fname="plot_fid.png")
-        plot_metric(metricsA, metricsB, "gen_IS", "IS per Epoch", "IS", save_dir=runB, fname="plot_is.png")
-        plot_metric(metricsA, metricsB, "gen_LPIPS", "LPIPS per Epoch", "LPIPS", save_dir=runB, fname="plot_lpips.png")
+        plot_metric(metricsA, metricsB, "recon_SSIM", "Recon SSIM (All)", "SSIM", save_dir=runB, fname="plot_ssim_recon.png")
+        plot_metric(metricsA, metricsB, "gen_FID", "Gen FID (All)", "FID", save_dir=runB, fname="plot_fid_gen.png")
+        plot_metric(metricsA, metricsB, "gen_IS", "Gen IS (All)", "IS", save_dir=runB, fname="plot_is_gen.png")
+        plot_metric(metricsA, metricsB, "recon_LPIPS", "Recon LPIPS (All)", "LPIPS", save_dir=runB, fname="plot_lpips_recon.png")
 
     wbB.finish()
     print("\n--- All experiments finished ---")
 
 if __name__ == "__main__":
-    # Windows/macOS에서 multiprocessing 호환성을 위한 설정
     mp.freeze_support()
     try: mp.set_start_method("spawn", force=True)
     except RuntimeError: pass
