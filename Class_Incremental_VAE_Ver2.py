@@ -1,13 +1,12 @@
 """
 Class Incremental Learning with VAE (+Contrastive, Generative Replay)
 
-- 순수 VAE (Conditional 아님)
-- Contrastive Loss / Prototype Bank / Generative Replay 구조 유지
+- 원래 Conditional VAE(CVAE) 코드에서 라벨 conditioning을 제거해서 "순수 VAE"로 변경
+- Contrastive Loss / Prototype Bank / Generative Replay 구조는 그대로 유지
 - generate_eval_samples:
-    * mu_proto_bank에 없는 클래스는 랜덤 μ로 샘플링
+    * mu_proto_bank에 없는 클래스는 랜덤 μ로 샘플링 (새 클래스도 바로 Fake Grid에 등장)
 - CIL Trainer:
-    * Incremental 학습에서 새 클래스 μ는 추가/업데이트,
-      이전 클래스 μ는 freeze (replay 분포 안정화)
+    * Incremental 학습에서 에폭마다 새 클래스 μ를 즉시 update_mu_proto로 갱신
 """
 
 # ============================ 1. Imports ============================
@@ -40,6 +39,7 @@ from torchmetrics.image.inception import InceptionScore
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from torchmetrics.image.ssim import StructuralSimilarityIndexMeasure
 
+
 # Global Configs
 warnings.filterwarnings(
     "ignore",
@@ -60,8 +60,7 @@ class ExperimentConfig:
     epochs_base: int = 20
     epochs_cil: int = 10
     batch_size: int = 128
-    lr_base: float = 1e-3         # Base pretrain learning rate
-    lr_cil: float = 5e-4          # CIL phase learning rate
+    lr: float = 1e-3
     num_classes: int = 10
 
     # --- VAE Loss ---
@@ -74,24 +73,24 @@ class ExperimentConfig:
     use_contrastive_baseline: bool = False
     use_contrastive_exp: bool = True
     tau: float = 0.4
-    lambda_con_max: float = 5e-3  # 5e-3 로 강화
+    lambda_con_max: float = 1e-6
     lambda_warmup_ep: int = 1
     hard_k: int = 5
 
     # --- Generative Replay ---
-    replay_ratio: float = 1.0     # 새 클래스와 비슷한 양의 replay
-    replay_sigma: float = 0.5     # 1.0 -> 0.5 (조금 더 타이트하게)
-    min_gen_per_cls: int = 16
+    replay_ratio: float = 0.5
+    replay_sigma: float = 1.0
+    min_gen_per_cls: int = 8
 
     # --- System ---
     num_workers: int = 0
     pin_memory: bool = torch.cuda.is_available()
 
     # --- Evaluation ---
-    eval_n_per_class: int = 1000  # 원래대로 복구
+    eval_n_per_class: int = 1000
     eval_resize: int = 299
-    eval_every_step: bool = True  # CIL epoch마다 metric 계산
-    metric_batch: int = 32        # 원래대로 복구
+    eval_every_step: bool = True
+    metric_batch: int = 32
     lpips_backbone: str = "alex"
     lpips_resize: int = 224
 
@@ -142,7 +141,12 @@ class VAE(nn.Module):
             nn.ConvTranspose2d(32, 1, 4, 2, 1),
         )
 
-        # projection head 제거, μ 자체를 contrastive에 사용
+        # contrastive용 projection head
+        self.proj = nn.Sequential(
+            nn.Linear(zdim, zdim),
+            nn.ReLU(),
+            nn.Linear(zdim, zdim),
+        )
 
     def encode(self, x, y=None):
         h = self.enc_conv(x).flatten(1)
@@ -165,10 +169,9 @@ class VAE(nn.Module):
         return x_logits, mu, lv, z
 
     @torch.no_grad()
-    def embed_mu(self, x, y=None):
-        """contrastive & proto용 μ (projection 없이 그대로 사용)"""
+    def embed_mu(self, x, y=None, project=True):
         mu, _ = self.encode(x, y)
-        return mu
+        return self.proj(mu) if project else mu
 
 
 # ============================ 4. Utilities ============================
@@ -311,6 +314,7 @@ def generate_eval_samples(model, classes, per_class: int, mu_proto_bank: dict):
     # --- Fake ---
     xs = []
     for c in classes:
+        # mu가 없으면 랜덤 μ 사용 (새 클래스도 바로 포함되도록)
         mu_c = mu_proto_bank.get(c, torch.randn(CFG.z_dim, device=DEVICE))
         z = mu_c.unsqueeze(0) + CFG.replay_sigma * torch.randn(
             per_class, mu_c.numel(), device=DEVICE
@@ -325,7 +329,7 @@ def generate_eval_samples(model, classes, per_class: int, mu_proto_bank: dict):
 @torch.no_grad()
 def analyze_proto_separation(classes, proto_bank: dict):
     """
-    Prototype separation (triu_indices 사용해서 mask shape 문제 제거)
+    Prototype separation (수정 버전: triu_indices 사용해서 mask shape 문제 제거)
     """
     vecs = [F.normalize(proto_bank[c].to(DEVICE), dim=0) for c in classes if c in proto_bank]
     if len(vecs) < 2:
@@ -349,7 +353,7 @@ def analyze_proto_separation(classes, proto_bank: dict):
 
 # ============================ 6. Base Trainer ============================
 def train_base(model, loader):
-    opt = torch.optim.Adam(model.parameters(), lr=CFG.lr_base)
+    opt = torch.optim.Adam(model.parameters(), lr=CFG.lr)
     model.train()
     for ep in range(CFG.epochs_base):
         beta = beta_at_epoch(ep, CFG.beta_warmup_base, CFG.beta_max)
@@ -534,7 +538,7 @@ class CIL_Trainer:
         self.run_dir = run_dir
         self.wb_run = wb_run
 
-        self.opt = torch.optim.Adam(self.model.parameters(), lr=CFG.lr_cil)
+        self.opt = torch.optim.Adam(self.model.parameters(), lr=CFG.lr)
         self.seen = base_classes.copy()
         self.global_batch_counter = 0
         self.metrics = defaultdict(list)
@@ -553,7 +557,7 @@ class CIL_Trainer:
         sums, counts = {c: None for c in classes}, {c: 0 for c in classes}
         for x, y in loader:
             x, y = x.to(DEVICE), y.to(DEVICE)
-            z = self.model.embed_mu(x, y)
+            z = self.model.embed_mu(x, y, project=True)
             for c in classes:
                 m = y == c
                 if m.any():
@@ -573,12 +577,6 @@ class CIL_Trainer:
 
     @torch.no_grad()
     def _update_mu_proto(self, mu_proto_bank, classes, ema=0.9):
-        """
-        mu prototype 업데이트
-        - base 단계: base_classes 전체에 대해 사용
-        - CIL 단계: 새 클래스(new_c)에 대해서만 호출해서 추가/보정
-        - 옛 클래스 μ는 freeze (classes 인자에 넣지 않음)
-        """
         if not classes:
             return mu_proto_bank
         loader = mnist_loader(classes, bs=256, train=False, shuffle=False)
@@ -632,9 +630,6 @@ class CIL_Trainer:
     # ----- contrastive pos/neg -----
     @torch.no_grad()
     def _build_pos_neg(self, z_new, y, seen, hard_k):
-        """
-        z_new: μ-space 상의 latent (이미 normalize 하기 전)
-        """
         _, D = z_new.shape
         z_pos = torch.empty_like(z_new)
         for c in y.unique():
@@ -670,8 +665,7 @@ class CIL_Trainer:
         total, bce, kl = vae_loss(logits, x_all, mu, lv, beta, CFG.kl_free_bits)
         batch_p_pos, con_loss_val = 0.0, 0.0
         if self.use_contrastive and self.seen:
-            # μ-space 에 바로 contrastive 적용
-            z = F.normalize(mu, dim=1)
+            z = F.normalize(self.model.proj(mu), dim=1)
             z_pos, z_neg = self._build_pos_neg(z, y_all, self.seen, CFG.hard_k)
             z_pos = F.normalize(z_pos, dim=1)
             z_neg = F.normalize(z_neg, dim=1)
@@ -717,11 +711,10 @@ class CIL_Trainer:
 
     @torch.no_grad()
     def _run_epoch_evaluation(self, classes_to_eval) -> dict:
-        """
-        - proto_bank는 EMA로 업데이트 (contrastive / separation용)
-        - mu_proto_bank는 여기서 건드리지 않음 (old 클래스 μ freeze)
-        """
         self.proto_bank = self._update_proto(self.proto_bank, classes_to_eval, ema=0.9)
+        self.mu_proto_bank = self._update_mu_proto(
+            self.mu_proto_bank, classes_to_eval, ema=0.9
+        )
         calculator = MetricCalculator(
             self.model, classes_to_eval, self.mu_proto_bank, self.proto_bank
         )
@@ -729,9 +722,9 @@ class CIL_Trainer:
 
     def _log_epoch_to_wandb(self, epoch_metrics: dict, eval_metrics: dict):
         """
-        에폭/스텝 끝에서 Summary + Real/Fake Grid를 W&B에 로깅
-        - Fake Grid: 지금까지 학습한 모든 클래스의 real 이미지를 재구성해서
-          64장 안에 클래스별로 최대한 균등하게 넣어줌
+        에폭 끝날 때 Summary + Real/Fake Grid를 W&B에 로깅
+        - Fake Grid는 '현재까지 학습한 모든 클래스'의 real 이미지를 재구성(reconstruction)해서
+          64장 안에 클래스별로 균등하게 들어가도록 구성
         """
         if not self.wb_run:
             return
@@ -762,6 +755,7 @@ class CIL_Trainer:
 
                 if num_cls > 0:
                     max_fake_imgs = 64      # 8x8 grid
+                    # 각 클래스가 최소 1장 이상 나오도록 per-class 개수 결정
                     per_class_fake = max(1, max_fake_imgs // num_cls)
                     per_class_fake = min(per_class_fake, 8)
 
@@ -833,8 +827,6 @@ class CIL_Trainer:
             for p in gen_model.parameters():
                 p.requires_grad_(False)
 
-            eval_metrics = {}
-
             for ep in range(CFG.epochs_cil):
                 beta = beta_at_epoch(ep, CFG.beta_warmup_cil, CFG.beta_max)
                 raw_lam = (
@@ -842,11 +834,14 @@ class CIL_Trainer:
                     if self.use_contrastive
                     else 0.0
                 )
-                lam_eff = raw_lam if self.use_contrastive else 0.0
+                lam_eff = (
+                    raw_lam / float(CFG.z_dim)
+                    if self.use_contrastive
+                    else 0.0
+                )
 
                 m_total = m_bce = m_kl = m_ppos = 0.0
                 n_batches = 0
-
                 for x_new, y_new in dl_new:
                     x_new, y_new = x_new.to(DEVICE), y_new.to(DEVICE)
                     if DEVICE == "cuda":
@@ -890,18 +885,17 @@ class CIL_Trainer:
                     )
 
                 epoch_metrics = {
-                    "total": m_total / max(1, n_batches),
-                    "bce": m_bce / max(1, n_batches),
-                    "kl": m_kl / max(1, n_batches),
+                    "total": m_total / n_batches,
+                    "bce": m_bce / n_batches,
+                    "kl": m_kl / n_batches,
                     "p_pos": m_ppos / max(1, n_batches),
                 }
 
-                # 새 클래스 μ는 에폭마다 조금씩 보정 (옛 클래스 μ는 freeze)
+                # --- 추가: 에폭마다 새 클래스 μ를 즉시 업데이트 ---
                 self.mu_proto_bank = self._update_mu_proto(
                     self.mu_proto_bank, [new_c], ema=0.7
                 )
 
-                # === 매 epoch마다 evaluation + W&B 로깅 ===
                 classes_to_eval = self.seen + [new_c]
                 eval_metrics = self._run_epoch_evaluation(classes_to_eval)
 
@@ -920,17 +914,11 @@ class CIL_Trainer:
                     f"BCE Avg: {epoch_metrics['bce']:.4f} | Global FID: {gm:.3f}"
                 )
 
-            # === step 종료 ===
+            # step 종료: seen 업데이트 + 아티팩트 저장 + 전체 프로토타입 재업데이트
             self.seen.append(new_c)
             self._save_local_artifacts(step, eval_metrics)
-
-            # proto_bank는 seen 전체에 대해 재계산 (contrastive용)
             self.proto_bank = self._update_proto(self.proto_bank, self.seen)
-            # mu_proto_bank는 새 클래스만 snapshot (ema=0.0)으로 고정, old는 freeze
-            self.mu_proto_bank = self._update_mu_proto(
-                self.mu_proto_bank, [new_c], ema=0.0
-            )
-
+            self.mu_proto_bank = self._update_mu_proto(self.mu_proto_bank, self.seen)
             print(f"[{self.label}] step {step} finished.")
         return self.metrics
 
